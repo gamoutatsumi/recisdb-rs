@@ -316,3 +316,87 @@ impl Read for ThreadedReader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+    use std::time::{Duration, Instant};
+
+    /// Creates an anonymous pipe pair `(read_end, write_end)` for testing.
+    /// `std::fs::File` implements `Read + Send + AsRawFd + 'static`,
+    /// satisfying ThreadedReader's source bounds without a custom mock.
+    fn create_pipe() -> (std::fs::File, std::fs::File) {
+        let mut fds = [0i32; 2];
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(
+            ret,
+            0,
+            "Failed to create pipe: {}",
+            io::Error::last_os_error()
+        );
+        let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        (read_end, write_end)
+    }
+
+    /// ThreadedReader should relay data written to the source pipe.
+    #[test]
+    fn test_normal_read() {
+        let (read_end, mut write_end) = create_pipe();
+        let test_data = b"Hello, ThreadedReader!";
+        write_end.write_all(test_data).unwrap();
+        drop(write_end);
+
+        let mut reader = ThreadedReader::new(read_end, 4096, 16).unwrap();
+        let mut buf = vec![0u8; test_data.len()];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, test_data.len());
+        assert_eq!(&buf[..n], test_data);
+    }
+
+    /// ThreadedReader should eventually signal end-of-stream when the
+    /// source is exhausted (write end closed).
+    #[test]
+    fn test_eof() {
+        let (read_end, mut write_end) = create_pipe();
+        write_end.write_all(b"data").unwrap();
+        drop(write_end);
+
+        let mut reader = ThreadedReader::new(read_end, 4096, 16).unwrap();
+        let mut buf = vec![0u8; 1024];
+        // The reader thread signals completion via Ok(0) (empty Vec) or
+        // via an error (POLLHUP → UnexpectedEof). Both indicate the
+        // stream has ended.
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Dropping a ThreadedReader whose reader thread has already exited
+    /// (EOF seen) should complete promptly without hanging on join().
+    #[test]
+    fn test_drop_after_eof() {
+        let (read_end, write_end) = create_pipe();
+        drop(write_end); // immediately signal EOF
+
+        let start = Instant::now();
+        {
+            let mut reader = ThreadedReader::new(read_end, 4096, 16).unwrap();
+            // Drain so the reader thread processes EOF and exits before drop.
+            let mut buf = vec![0u8; 1024];
+            let _ = reader.read(&mut buf);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drop took too long: {:?}",
+            elapsed
+        );
+    }
+}
