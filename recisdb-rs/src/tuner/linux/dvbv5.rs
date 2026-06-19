@@ -89,32 +89,33 @@ impl UnTunedTuner {
 
                     dvbv5_sys::dvb_fe_set_parms(p)
                 }
-                ChannelType::BS(_, filter) | ChannelType::CS(_, filter) => {
+                ChannelType::BS(ch_num, filter) | ChannelType::CS(ch_num, filter) => {
                     dvb_set_compat_delivery_system(p, SYS_ISDBS as u32);
                     dvbv5_sys::dvb_fe_store_parm(p, DTV_FREQUENCY as c_uint, raw_freq.freq_hz);
+                    let lookup_tsid_or_warn = |name: &str| -> u32 {
+                        match table::lookup_tsid(name) {
+                            Some(id) => {
+                                info!("{:?} -> AbsTsId({}) using the hardcoded table", filter, id);
+                                id
+                            }
+                            None => {
+                                warn!("Failed to get TSID. Consider using '--tsid'.");
+                                NO_STREAM_ID_FILTER as u32
+                            }
+                        }
+                    };
                     let id = match (raw_freq.stream_id, &ch.ch_type) {
                         // Explicit TSID specified via --tsid: use directly
                         (Some(id), _) if id >= 12 => id,
-                        // BS relative TS number: look up the hardcoded table
-                        (Some(_), ChannelType::BS(..))
-                        // CS without explicit TSID: look up the transponder's
-                        // TSID to filter to a single TS instead of receiving
-                        // the entire transponder (up to 12 slots)
-                        | (None, ChannelType::CS(..)) => {
-                            match table::lookup_tsid(ch.get_raw_ch_name()) {
-                                Some(id) => {
-                                    info!(
-                                        "{:?} -> AbsTsId({}) using the hardcoded table",
-                                        filter, id
-                                    );
-                                    id
-                                }
-                                None => {
-                                    warn!("Failed to get TSID. Consider using '--tsid'.");
-                                    NO_STREAM_ID_FILTER as u32
-                                }
-                            }
+                        // BS relative TS number: construct the canonical name
+                        // (e.g. "BS03_0") and look up the hardcoded table.
+                        // Using parsed values ensures "BS3_0" also resolves.
+                        (Some(slot), ChannelType::BS(..)) => {
+                            lookup_tsid_or_warn(&format!("BS{ch_num:02}_{slot}"))
                         }
+                        // CS without explicit TSID: construct the canonical
+                        // name (e.g. "CS2") so that "CS02" also resolves.
+                        (None, ChannelType::CS(..)) => lookup_tsid_or_warn(&format!("CS{ch_num}")),
                         // BS without explicit TSID: no filter
                         _ => NO_STREAM_ID_FILTER as u32,
                     };
