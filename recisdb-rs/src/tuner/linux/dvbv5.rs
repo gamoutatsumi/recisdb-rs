@@ -200,9 +200,17 @@ impl UnTunedTuner {
 }
 
 pub struct Tuner {
-    inner: UnTunedTuner,
-    state: TunedDvbInternalState,
+    // Field order matters for drop safety: `stream` (ThreadedReader) must
+    // be dropped BEFORE `inner` (frontend/demux). Rust drops fields in
+    // declaration order. If `inner` drops first, dvb_dmx_close() issues
+    // DMX_STOP which halts data flow to the DVR ring buffer. The reader
+    // thread in ThreadedReader may then block forever in read() on the
+    // empty ring buffer, causing join() to deadlock. By dropping `stream`
+    // first, the reader thread can exit (shutdown flag + receiver dropped)
+    // while the device is still actively supplying data.
     stream: BufReader<AllowStdIo<ThreadedReader>>,
+    state: TunedDvbInternalState,
+    inner: UnTunedTuner,
 }
 
 pub enum TunedDvbInternalState {
