@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use log::{debug, warn};
 
@@ -28,6 +29,12 @@ const ENV_TUNER_QUEUE_CAPACITY: &str = "RECISDB_TUNER_QUEUE_CAPACITY";
 /// reader thread actually exiting. 100ms provides a good balance between
 /// responsiveness and avoiding excessive poll syscalls.
 const POLL_TIMEOUT_MS: i32 = 100;
+
+/// Maximum time to wait for the reader thread to exit during drop.
+/// If the thread does not observe the shutdown flag within this period
+/// (e.g., it is blocked in an uninterruptible device read syscall after
+/// DMX_STOP), the thread is detached to avoid deadlocking the drop chain.
+const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A buffered wrapper around any `Read` source that decouples the reading
 /// from the consuming thread by using a dedicated background thread.
@@ -258,9 +265,31 @@ impl Drop for ThreadedReader {
         // send(), it cannot observe the shutdown flag and join() may hang.
         let _ = self.receiver.take();
 
-        // Join the reader thread to ensure deterministic cleanup.
+        // Join the reader thread with a timeout to avoid deadlocking the
+        // entire drop chain when the thread is stuck in a blocking device
+        // read syscall (e.g., DVB DVR read after DMX_STOP).
+        // std::thread::JoinHandle::join() has no built-in timeout, so we
+        // poll is_finished() at short intervals.
         if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
+            let deadline = Instant::now() + DROP_JOIN_TIMEOUT;
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                warn!(
+                    "Tuner reader thread did not exit within {:?}; detaching.",
+                    DROP_JOIN_TIMEOUT
+                );
+                // Detach: the thread holds its own copies of the source
+                // and sender, and will exit once it observes the shutdown
+                // flag (via poll timeout) or the source yields an error.
+                // Forgetting the JoinHandle prevents join() from blocking
+                // the drop chain indefinitely.
+                std::mem::forget(handle);
+            }
         }
     }
 }
@@ -314,5 +343,144 @@ impl Read for ThreadedReader {
             // Sender dropped unexpectedly; treat as EOF
             Err(_) => Ok(0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+    use std::time::{Duration, Instant};
+
+    /// Creates an anonymous pipe pair `(read_end, write_end)` for testing.
+    /// `std::fs::File` implements `Read + Send + AsRawFd + 'static`,
+    /// satisfying ThreadedReader's source bounds without a custom mock.
+    fn create_pipe() -> (std::fs::File, std::fs::File) {
+        let mut fds = [0i32; 2];
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(
+            ret,
+            0,
+            "Failed to create pipe: {}",
+            io::Error::last_os_error()
+        );
+        let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        (read_end, write_end)
+    }
+
+    /// ThreadedReader should relay data written to the source pipe.
+    #[test]
+    fn test_normal_read() {
+        let (read_end, mut write_end) = create_pipe();
+        let test_data = b"Hello, ThreadedReader!";
+        write_end.write_all(test_data).unwrap();
+        drop(write_end);
+
+        let mut reader = ThreadedReader::new(read_end, 4096, 16).unwrap();
+        let mut buf = vec![0u8; test_data.len()];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(n, test_data.len());
+        assert_eq!(&buf[..n], test_data);
+    }
+
+    /// ThreadedReader should eventually signal end-of-stream when the
+    /// source is exhausted (write end closed).
+    #[test]
+    fn test_eof() {
+        let (read_end, mut write_end) = create_pipe();
+        write_end.write_all(b"data").unwrap();
+        drop(write_end);
+
+        let mut reader = ThreadedReader::new(read_end, 4096, 16).unwrap();
+        let mut buf = vec![0u8; 1024];
+        // The reader thread signals completion via Ok(0) (empty Vec) or
+        // via an error (POLLHUP → UnexpectedEof). Both indicate the
+        // stream has ended.
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Dropping a ThreadedReader whose reader thread has already exited
+    /// (EOF seen) should complete promptly without hanging on join().
+    #[test]
+    fn test_drop_after_eof() {
+        let (read_end, write_end) = create_pipe();
+        drop(write_end); // immediately signal EOF
+
+        let start = Instant::now();
+        {
+            let mut reader = ThreadedReader::new(read_end, 4096, 16).unwrap();
+            // Drain so the reader thread processes EOF and exits before drop.
+            let mut buf = vec![0u8; 1024];
+            let _ = reader.read(&mut buf);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drop took too long: {:?}",
+            elapsed
+        );
+    }
+
+    /// Mock source that simulates the DVB deadlock scenario:
+    /// poll() returns POLLIN immediately (via /dev/null) but read()
+    /// blocks indefinitely, mimicking a DVR read stuck in
+    /// wait_event_interruptible after DMX_STOP has halted data supply.
+    struct BlockingMockSource {
+        fd_file: std::fs::File,
+    }
+
+    impl BlockingMockSource {
+        fn new() -> Self {
+            Self {
+                fd_file: std::fs::File::open("/dev/null").unwrap(),
+            }
+        }
+    }
+
+    impl Read for BlockingMockSource {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            // Block long enough to exceed DROP_JOIN_TIMEOUT. This
+            // simulates the DVB driver's indefinite block after DMX_STOP.
+            thread::sleep(Duration::from_secs(60));
+            Ok(0)
+        }
+    }
+
+    impl AsRawFd for BlockingMockSource {
+        fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+            self.fd_file.as_raw_fd()
+        }
+    }
+
+    /// Dropping a ThreadedReader whose reader thread is stuck in a
+    /// blocking read() should complete within DROP_JOIN_TIMEOUT instead
+    /// of hanging forever. The reader thread is detached on timeout.
+    #[test]
+    fn test_drop_with_blocking_source() {
+        let source = BlockingMockSource::new();
+        // Give the reader thread time to enter the blocking read().
+        let reader = ThreadedReader::new(source, 4096, 16).unwrap();
+        thread::sleep(Duration::from_millis(500));
+
+        let start = Instant::now();
+        drop(reader);
+        let elapsed = start.elapsed();
+
+        // Drop must complete within DROP_JOIN_TIMEOUT + margin.
+        // Without the timeout fix, this would hang for 60 seconds.
+        assert!(
+            elapsed < DROP_JOIN_TIMEOUT + Duration::from_secs(3),
+            "drop took too long: {:?} (expected < {:?})",
+            elapsed,
+            DROP_JOIN_TIMEOUT + Duration::from_secs(3)
+        );
     }
 }
